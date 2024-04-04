@@ -43,8 +43,23 @@ import (
 // Some commands:
 
 var gennotice = flag.Bool("gennotice", false, "output third party notice file")
-var validatelinks = flag.Bool("validatelinks", false, "validate license links")
-var sourceMirror = flag.String("source-mirror", "", "storage location that mirrors source, needed for Mozilla license, i.e. https://storage.googleapis.com/mydownloads/open-source-mirror/")
+var validateLinks = flag.Bool("validatelinks", true, "validate license links, defaults to true")
+var localDeps arrayFlags
+
+func init() {
+	flag.Var(&localDeps, "localDep", "module name of local dep, referenced by replace in go.mod, i.e. github.com/project/repo")
+}
+
+type arrayFlags []string
+
+func (f *arrayFlags) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *arrayFlags) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
 
 func main() {
 	flag.Parse()
@@ -53,6 +68,9 @@ func main() {
 	sourceModules, err := getSourceModules(binDirs)
 	if err != nil {
 		log.Fatal(err.Error())
+	}
+	for _, dep := range localDeps {
+		sourceModules[dep] = struct{}{}
 	}
 
 	pkgCfg := &packages.Config{
@@ -95,6 +113,10 @@ func main() {
 			verParts := strings.Split(pkgDir, "@")
 			pkgRepo := verParts[0]
 
+			if len(verParts) <= 1 {
+				panic(fmt.Sprintf("expected @ in %s", pkgDir))
+			}
+
 			pkgDep, ok := depMap[pkgRepo]
 			if !ok {
 				version := verParts[1]
@@ -107,7 +129,7 @@ func main() {
 					fmt.Printf("Cannot find license file in %s\n", pkgDir)
 					failed = true
 				}
-				licType, _ := getLicType(licenseMatcher, lic)
+				licType := getLicType(licenseMatcher, lic)
 
 				pkgDep = &PkgDep{
 					repo:     pkgRepo,
@@ -212,57 +234,18 @@ func getLicensePath(pkgDir string) string {
 	return ""
 }
 
-func getSourceMirror(pkgDir string) (string, error) {
-	if *sourceMirror == "" {
-		log.Printf("No source mirror defined, needed for %s\n", pkgDir)
-		return "no source mirror defined", nil
-	}
-	repo := strings.TrimPrefix(pkgDir, os.Getenv("HOME")+"/go/pkg/mod/")
-	repo = strings.Replace(repo, "!", "", -1)
-	localDir := repo
-	for to, from := range pathXlat {
-		repo = strings.Replace(repo, to, from, -1)
-	}
-	if strings.HasPrefix(repo, "github.com/") {
-		// just point to github repo, we don't need to maintain a copy
-		repo = strings.Replace(repo, "@", "/releases/tag/", 1)
-		return repo, nil
-	}
-	repo = strings.Replace(repo, "/", "-", -1)
-	repo = strings.Replace(repo, "@", ".", -1)
-	repo += ".tar"
-	tarFile := path.Base(repo)
-	srcMirror := strings.TrimSuffix(*sourceMirror, "/")
-	repo = srcMirror + "/" + repo
-	// make sure mirror exists
-	resp, err := http.Get(repo)
-	if err != nil {
-		err = fmt.Errorf("failed to retrieve mirrored code at %s: %s", repo, err)
-	}
-	if err == nil && resp.StatusCode == http.StatusNotFound {
-		// create a tar file to upload
-		tarCmd := exec.Command("tar", "-cvf", tarFile, localDir)
-		tarCmd.Dir = os.Getenv("HOME") + "/go/pkg/mod"
-		out, cmdErr := tarCmd.CombinedOutput()
-		if cmdErr != nil {
-			log.Fatalf(`tar command "(cd %s; %s)" failed: %s, %s`, tarCmd.Dir, tarCmd.String(), string(out), cmdErr)
-		}
-		err = fmt.Errorf("please upload %s/%s to online storage at %s for mirroring", tarCmd.Dir, tarFile, repo)
-	}
-	if err == nil && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-		err = fmt.Errorf("get %s failed: %d", repo, resp.StatusCode)
-	}
-	return repo, err
-}
-
 func genNotice(dep *PkgDep) error {
-	var mirrorErr error
 	fmt.Printf("---------------------------------------------------\n")
 	fmt.Printf("License notice for %s\n", dep.pkg.PkgPath)
 	if licRequiresSourceMirror(dep.licType) {
-		mirrorPath, merr := getSourceMirror(dep.dir)
-		fmt.Printf("A copy of the source code can be found at %s\n\n", mirrorPath)
-		mirrorErr = merr
+		link := getPkgLink(dep.pkg.PkgPath)
+		if *validateLinks {
+			resp, err := httpGetRetry(link)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("failed to validate source link %s", link)
+			}
+		}
+		fmt.Printf("A copy of the source code can be found at %s\n\n", link)
 	}
 	fmt.Printf("---------------------------------------------------\n\n")
 	lic, err := os.ReadFile(dep.license)
@@ -270,7 +253,7 @@ func genNotice(dep *PkgDep) error {
 		log.Fatal(err.Error())
 	}
 	fmt.Printf("%s\n\n", string(lic))
-	return mirrorErr
+	return nil
 }
 
 // trailing API version which is present on disk, but not in the URL
@@ -325,7 +308,9 @@ func genRef(dep *PkgDep) {
 	} else if hasPrefix(link, "k8s.io") {
 		link = strings.Replace(link, "k8s.io", "github.com/kubernetes", 1)
 	} else if hasPrefix(link, "sigs.k8s.io") {
-		link = strings.Replace(link, "k8s.io", "github.com/kubernetes-sigs", 1)
+		link = strings.Replace(link, "sigs.k8s.io", "github.com/kubernetes-sigs", 1)
+	} else if hasPrefix(link, "gocloud.dev") {
+		link = strings.Replace(link, "gocloud.dev", "github.com/google/go-cloud", 1)
 	}
 
 	if hasPrefix(link, "github.com") {
@@ -352,7 +337,7 @@ func genRef(dep *PkgDep) {
 
 	// test that link is reachable
 	validLink := fmt.Sprintf("INVALID:%v", links)
-	if *validatelinks {
+	if *validateLinks {
 		for _, try := range links {
 			try = "https://" + try
 			resp, err := httpGetRetry(try)
@@ -416,13 +401,13 @@ func httpGetRetry(link string) (*http.Response, error) {
 	return resp, err
 }
 
-func getLicType(matcher *LicenseMatcher, licFile string) (string, float32) {
+func getLicType(matcher *LicenseMatcher, licFile string) string {
 	contents, err := os.ReadFile(licFile)
 	if err != nil {
 		fmt.Printf("Failed to read %s, %s\n", licFile, err)
 		log.Fatal(err.Error())
 	}
-	return matcher.Match(string(contents))
+	return matcher.MatchMulti(string(contents))
 }
 
 func licRequiresSourceMirror(licType string) bool {
@@ -460,4 +445,13 @@ func getGitBuild() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func getPkgLink(pkgPath string) string {
+	parts := strings.Split(pkgPath, "/")
+	if parts[0] == "github.com" && len(parts) > 3 {
+		// inject tree/main into link
+		return "https://" + parts[0] + "/" + parts[1] + "/" + parts[2] + "/tree/main/" + strings.Join(parts[3:], "/")
+	}
+	return "https://" + pkgPath
 }

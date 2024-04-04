@@ -17,6 +17,7 @@ package main
 import (
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/agnivade/levenshtein"
 )
@@ -84,4 +85,26 @@ func (s *LicenseMatcher) Match(contents string) (string, float32) {
 		return UnknownLicense, matches[0].DistanceRatio
 	}
 	return matches[0].Name, matches[0].DistanceRatio
+}
+
+func (s *LicenseMatcher) MatchMulti(contents string) string {
+	match, _ := s.Match(contents)
+	if match != UnknownLicense {
+		return match
+	}
+	// Some license files are multiple licenses together.
+	// Try to split by the copyright line which typically is at the
+	// start of the license, and match each section.
+	matches := []string{}
+	parts := strings.Split(contents, "Copyright (c)")
+	for _, part := range parts {
+		match, _ := s.Match(part)
+		if match != UnknownLicense {
+			matches = append(matches, match)
+		}
+	}
+	if len(matches) == 0 {
+		return UnknownLicense
+	}
+	return strings.Join(matches, ", ")
 }
